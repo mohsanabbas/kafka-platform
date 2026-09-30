@@ -1,0 +1,14 @@
+{
+  "brokerCapacities": [
+    {
+      "brokerId": "-1",
+      "capacity": {
+        "DISK": "100000",
+        "CPU": "100",
+        "NW_IN": "100000",
+        "NW_OUT": "100000"
+      },
+      "doc": "Default for every broker. Disk is MB, CPU is percent, network is KB/s. Large on purpose so the first drills are about placement, not a full disk."
+    }
+  ]
+}

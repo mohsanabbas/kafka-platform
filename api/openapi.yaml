@@ -1,0 +1,459 @@
+openapi: 3.0.3
+info:
+  title: opsd API
+  version: 1.0.0
+  description: >
+    Platform operations for the Kafka lab: cluster health, consumer-group lag,
+    guarded offset resets, and read-only Cruise Control views. The service
+    listens on 127.0.0.1:8090 by default. It has no authentication; in
+    production an auth proxy fronts it and sets X-Actor from the SSO identity.
+servers:
+  - url: http://localhost:8090
+tags:
+  - name: health
+    description: Liveness and cluster health.
+  - name: offsets
+    description: Consumer-group lag and guarded offset resets.
+  - name: cruise-control
+    description: Read-only Cruise Control state, proposals, and reviews.
+paths:
+  /healthz:
+    get:
+      tags: [health]
+      summary: Liveness probe
+      responses:
+        "204":
+          description: Service is up.
+  /v1/cluster/health:
+    get:
+      tags: [health]
+      summary: Cluster health
+      description: Point-in-time view of brokers, topic and partition counts, and any offline, under-min-ISR, or under-replicated partitions.
+      responses:
+        "200":
+          description: Cluster health.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClusterHealth"
+        "502":
+          $ref: "#/components/responses/Error"
+        "504":
+          $ref: "#/components/responses/Error"
+  /v1/groups/{group}/lag:
+    get:
+      tags: [offsets]
+      summary: Group lag
+      parameters:
+        - $ref: "#/components/parameters/Group"
+      responses:
+        "200":
+          description: Lag per partition.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Lag"
+        "502":
+          $ref: "#/components/responses/Error"
+        "504":
+          $ref: "#/components/responses/Error"
+  /v1/groups/{group}/offsets/plan:
+    post:
+      tags: [offsets]
+      summary: Plan an offset reset
+      description: Computes offset moves without applying them. The response is the plan to review and pass to apply.
+      parameters:
+        - $ref: "#/components/parameters/Group"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [topic, mode]
+              properties:
+                topic:
+                  type: string
+                mode:
+                  $ref: "#/components/schemas/Mode"
+                partitions:
+                  type: array
+                  description: Limits the plan. Omit for every partition of the topic.
+                  items:
+                    type: integer
+                    format: int32
+                timestamp:
+                  type: string
+                  format: date-time
+                  description: Required when mode is timestamp.
+      responses:
+        "200":
+          description: The plan. `moves` is empty when the reset is already a no-op; apply refuses an empty plan.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Plan"
+        "400":
+          $ref: "#/components/responses/Error"
+        "502":
+          $ref: "#/components/responses/Error"
+        "504":
+          $ref: "#/components/responses/Error"
+  /v1/groups/{group}/offsets/apply:
+    post:
+      tags: [offsets]
+      summary: Apply a planned offset reset
+      description: Refuses an active group or a stale plan (any `from` no longer matches the committed offset) and audits the apply to the platform.audit topic.
+      parameters:
+        - $ref: "#/components/parameters/Group"
+        - $ref: "#/components/parameters/Actor"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [plan, reason]
+              properties:
+                plan:
+                  $ref: "#/components/schemas/Plan"
+                reason:
+                  type: string
+                  description: Incident or change reference; recorded in the audit event.
+      responses:
+        "200":
+          description: Applied.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  applied:
+                    type: boolean
+                  moves:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Move"
+        "400":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "502":
+          $ref: "#/components/responses/Error"
+        "504":
+          $ref: "#/components/responses/Error"
+  /v1/cruise-control/state:
+    get:
+      tags: [cruise-control]
+      summary: Monitor, executor, and analyzer state
+      responses:
+        "200":
+          description: Cruise Control state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CCState"
+        "502":
+          $ref: "#/components/responses/Error"
+        "504":
+          $ref: "#/components/responses/Error"
+  /v1/cruise-control/proposals:
+    get:
+      tags: [cruise-control]
+      summary: Cached rebalance proposals
+      description: Read-only. Reading moves nothing and needs no review.
+      responses:
+        "200":
+          description: Proposal summary and per-goal status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Proposals"
+        "502":
+          $ref: "#/components/responses/Error"
+        "504":
+          $ref: "#/components/responses/Error"
+  /v1/cruise-control/reviews:
+    get:
+      tags: [cruise-control]
+      summary: Two-step verification board
+      description: Requests Cruise Control has parked pending review. Executing them happens in the Cruise Control UI, not here.
+      responses:
+        "200":
+          description: Pending reviews.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Review"
+        "502":
+          $ref: "#/components/responses/Error"
+        "504":
+          $ref: "#/components/responses/Error"
+components:
+  parameters:
+    Group:
+      name: group
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Consumer group.
+    Actor:
+      name: X-Actor
+      in: header
+      required: true
+      schema:
+        type: string
+      description: Operator identity for the audit event. In production an auth proxy sets this from the SSO identity and strips client-supplied values.
+  responses:
+    Error:
+      description: Error response. 400 invalid request or empty plan; 409 active group or stale plan; 504 dependency timeout; 502 other dependency failure.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+    Mode:
+      type: string
+      enum: [skip, latest, earliest, timestamp]
+      description: skip moves one record past the commit; timestamp needs `timestamp`.
+    ClusterHealth:
+      type: object
+      properties:
+        clusterId:
+          type: string
+        brokers:
+          type: array
+          items:
+            $ref: "#/components/schemas/Broker"
+        topics:
+          type: integer
+        partitions:
+          type: integer
+        offline:
+          type: array
+          items:
+            $ref: "#/components/schemas/PartitionState"
+        underMinIsr:
+          type: array
+          items:
+            $ref: "#/components/schemas/PartitionState"
+        underReplicated:
+          type: array
+          items:
+            $ref: "#/components/schemas/PartitionState"
+    Broker:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int32
+        host:
+          type: string
+        port:
+          type: integer
+          format: int32
+        rack:
+          type: string
+    PartitionState:
+      type: object
+      properties:
+        topic:
+          type: string
+        partition:
+          type: integer
+          format: int32
+        leader:
+          type: integer
+          format: int32
+          description: -1 when the partition has no leader.
+        replicas:
+          type: array
+          items:
+            type: integer
+            format: int32
+        isr:
+          type: array
+          items:
+            type: integer
+            format: int32
+        minIsr:
+          type: integer
+        error:
+          type: string
+    Lag:
+      type: object
+      properties:
+        group:
+          type: string
+        state:
+          type: string
+        members:
+          type: integer
+        total:
+          type: integer
+          format: int64
+        partitions:
+          type: array
+          items:
+            $ref: "#/components/schemas/PartitionLag"
+    PartitionLag:
+      type: object
+      properties:
+        topic:
+          type: string
+        partition:
+          type: integer
+          format: int32
+        committed:
+          type: integer
+          format: int64
+        end:
+          type: integer
+          format: int64
+        lag:
+          type: integer
+          format: int64
+        member:
+          type: string
+    Plan:
+      type: object
+      properties:
+        request:
+          $ref: "#/components/schemas/PlanRequest"
+        groupState:
+          type: string
+        members:
+          type: integer
+        moves:
+          type: array
+          items:
+            $ref: "#/components/schemas/Move"
+        createdAt:
+          type: string
+          format: date-time
+    PlanRequest:
+      type: object
+      properties:
+        group:
+          type: string
+        topic:
+          type: string
+        mode:
+          $ref: "#/components/schemas/Mode"
+        partitions:
+          type: array
+          items:
+            type: integer
+            format: int32
+        timestamp:
+          type: string
+          format: date-time
+    Move:
+      type: object
+      properties:
+        partition:
+          type: integer
+          format: int32
+        from:
+          type: integer
+          format: int64
+        to:
+          type: integer
+          format: int64
+        end:
+          type: integer
+          format: int64
+    CCState:
+      type: object
+      properties:
+        MonitorState:
+          type: object
+          properties:
+            state:
+              type: string
+            numMonitoredWindows:
+              type: integer
+            monitoringCoveragePct:
+              type: number
+            numValidPartitions:
+              type: integer
+            numTotalPartitions:
+              type: integer
+        ExecutorState:
+          type: object
+          properties:
+            state:
+              type: string
+        AnalyzerState:
+          type: object
+          properties:
+            isProposalReady:
+              type: boolean
+            readyGoals:
+              type: array
+              items:
+                type: string
+    Proposals:
+      type: object
+      properties:
+        summary:
+          type: object
+          properties:
+            numReplicaMovements:
+              type: integer
+            numLeaderMovements:
+              type: integer
+            dataToMoveMB:
+              type: integer
+              format: int64
+            monitoredPartitionsPercentage:
+              type: number
+            recentWindows:
+              type: integer
+            provisionStatus:
+              type: string
+            provisionRecommendation:
+              type: string
+            onDemandBalancednessScoreBefore:
+              type: number
+            onDemandBalancednessScoreAfter:
+              type: number
+            excludedTopics:
+              type: array
+              items:
+                type: string
+        goalSummary:
+          type: array
+          items:
+            type: object
+            properties:
+              goal:
+                type: string
+              status:
+                type: string
+                description: FIXED, NO-ACTION, or VIOLATED.
+    Review:
+      type: object
+      properties:
+        Id:
+          type: integer
+        Status:
+          type: string
+        EndpointWithParams:
+          type: string
+        Reason:
+          type: string
+        SubmitterAddress:
+          type: string
+        SubmissionTimeMs:
+          type: integer
+          format: int64
